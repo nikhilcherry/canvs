@@ -103,6 +103,16 @@ def test_kaggle_notebook_self_contained_with_dataset_note_and_deps():
     )
 
 
+def test_kaggle_notebook_has_kernelspec_metadata():
+    # Kaggle runs pushed notebooks via papermill, which requires
+    # nb.metadata.kernelspec.name to resolve which kernel to execute --
+    # without it the kernel run errors out before any cell runs.
+    _register_pipeline_nodes()
+    artifact = compile_graph(_build_graph(), "kaggle", "run457", registry=registry)
+    nb = nbformat.reads(artifact.content, as_version=4)
+    assert nb.metadata.get("kernelspec", {}).get("name")
+
+
 def test_colab_notebook_has_no_dataset_markdown():
     _register_pipeline_nodes()
     artifact = compile_graph(_build_graph(), "colab", "run789", registry=registry)

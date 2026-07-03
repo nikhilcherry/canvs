@@ -114,23 +114,32 @@ def test_push_kernel_raises_on_api_error(monkeypatch):
 
 
 def test_kernel_status_normalizes_kaggle_values(monkeypatch):
+    # The real kernels_status() response's .status is a KernelWorkerStatus
+    # enum member (e.g. KernelWorkerStatus.ERROR), not a plain string --
+    # the fake mirrors that shape via a .name attribute so a regression to
+    # naive string comparison would fail this test.
+    class FakeEnumStatus:
+        def __init__(self, name):
+            self.name = name
+
     class FakeResponse:
-        def __init__(self, status):
-            self.status = status
+        def __init__(self, status_name):
+            self.status = FakeEnumStatus(status_name)
 
     class FakeStatusApi:
-        def __init__(self, status):
-            self._status = status
+        def __init__(self, status_name):
+            self._status_name = status_name
 
-        def kernels_status_cli(self, kernel_slug):
-            return FakeResponse(self._status)
+        def kernels_status(self, kernel_slug):
+            return FakeResponse(self._status_name)
 
     for raw, expected in [
-        ("queued", "running"),
-        ("running", "running"),
-        ("complete", "done"),
-        ("error", "failed"),
-        ("cancelled", "failed"),
+        ("QUEUED", "running"),
+        ("RUNNING", "running"),
+        ("COMPLETE", "done"),
+        ("ERROR", "failed"),
+        ("CANCEL_REQUESTED", "failed"),
+        ("CANCEL_ACKNOWLEDGED", "failed"),
     ]:
         monkeypatch.setattr(kaggle_push, "_get_api", lambda raw=raw: FakeStatusApi(raw))
         assert kaggle_push.kernel_status("alice/slug") == {"status": expected}

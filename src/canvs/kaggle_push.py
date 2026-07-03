@@ -18,9 +18,11 @@ import tempfile
 _STATUS_MAP = {
     "queued": "running",
     "running": "running",
+    "new_script": "running",
     "complete": "done",
     "error": "failed",
-    "cancelled": "failed",
+    "cancel_requested": "failed",
+    "cancel_acknowledged": "failed",
 }
 
 
@@ -118,8 +120,10 @@ def push_kernel(
 def kernel_status(kernel_slug: str) -> dict:
     """Normalize the Kaggle kernel status API to canvs's running/done/failed."""
     api = _get_api()
-    response = api.kernels_status_cli(kernel_slug)
-    raw_status = getattr(response, "status", None)
-    if raw_status is None and isinstance(response, dict):
-        raw_status = response.get("status")
+    # kernels_status_cli (unlike the kernels_status it wraps) only prints
+    # and returns None -- and the real response's .status is a
+    # KernelWorkerStatus enum member (e.g. KernelWorkerStatus.ERROR), not a
+    # string, so it must be normalized via .name.lower() before map lookup.
+    response = api.kernels_status(kernel_slug)
+    raw_status = response.status.name.lower()
     return {"status": _STATUS_MAP.get(raw_status, "running")}

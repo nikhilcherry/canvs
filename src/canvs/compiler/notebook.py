@@ -40,5 +40,13 @@ def compile_notebook(graph, registry, run_id: str, target: str, env_vars: dict[s
     cells.append(new_code_cell(templates.render_execution_block(graph, registry)))
     cells.append(new_code_cell(templates.render_footer()))
 
-    nb = new_notebook(cells=cells)
+    # Kaggle executes pushed notebooks with papermill, which resolves the
+    # kernel to run via nb.metadata.kernelspec.name -- without it papermill
+    # raises "No kernel name found in notebook" and the kernel run errors
+    # out immediately, before any cell executes.
+    metadata = {
+        "kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},
+        "language_info": {"name": "python"},
+    }
+    nb = new_notebook(cells=cells, metadata=metadata)
     return nbformat.writes(nb)
