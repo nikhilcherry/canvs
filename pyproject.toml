@@ -23,6 +23,9 @@ dev = [
     "nbconvert>=7",
     "ipykernel>=6",
 ]
+kaggle = [
+    "kaggle",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

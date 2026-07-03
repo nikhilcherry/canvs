@@ -73,3 +73,34 @@ def test_kill_terminates_running_process(tmp_path):
     handle.kill()
     time.sleep(1.0)
     assert handle.process.poll() is not None
+
+
+def test_kill_escalates_to_sigkill_when_process_ignores_sigterm(tmp_path):
+    @node(category="proc", name="Stubborn")
+    def stubborn(n: int = 1) -> int:
+        import signal as _signal
+        import time as _time
+
+        _signal.signal(_signal.SIGTERM, _signal.SIG_IGN)
+        _time.sleep(30)
+        return n
+
+    graph = Graph(
+        graph_id="g1",
+        name="p",
+        nodes=[GraphNode(id="n1", spec="proc.stubborn", config={"n": 1})],
+    )
+    run_id = "testrun3"
+    artifact = compile_graph(graph, "local", run_id, registry=registry)
+
+    runner = LocalRunner(runs_dir=str(tmp_path))
+    handle = runner.start(artifact)
+    time.sleep(0.5)
+    assert handle.process.poll() is None  # still running, ignoring SIGTERM
+
+    start = time.time()
+    handle.kill()
+    elapsed = time.time() - start
+
+    assert handle.process.poll() is not None  # escalation reaped it
+    assert elapsed >= 5.0  # waited the full terminate() grace period first

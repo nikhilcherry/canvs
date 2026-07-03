@@ -21,3 +21,7 @@ create table metrics (
   payload jsonb,
   created_at timestamptz default now()
 );
+
+-- Required for the frontend's realtime channel (src/realtime.ts) to
+-- receive INSERT events on this table. Apply after the tables above.
+-- alter publication supabase_realtime add table metrics;

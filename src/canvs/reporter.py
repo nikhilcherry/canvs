@@ -13,6 +13,8 @@ import os
 import time
 
 _WARNED = False
+_SUPABASE_CLIENT = None
+_SUPABASE_CLIENT_ATTEMPTED = False
 
 
 def _warn_once(msg: str) -> None:
@@ -20,6 +22,34 @@ def _warn_once(msg: str) -> None:
     if not _WARNED:
         print(f"[reporter] warning: {msg}")
         _WARNED = True
+
+
+def _get_supabase_client():
+    """Return the process-wide Supabase client, creating it at most once.
+
+    A prior creation failure (missing package, bad URL) is cached too --
+    every canvs_report() call would otherwise retry construction.
+    """
+    global _SUPABASE_CLIENT, _SUPABASE_CLIENT_ATTEMPTED
+    if _SUPABASE_CLIENT is not None:
+        return _SUPABASE_CLIENT
+    if _SUPABASE_CLIENT_ATTEMPTED:
+        return None
+    _SUPABASE_CLIENT_ATTEMPTED = True
+
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        return None
+
+    try:
+        from supabase import create_client
+
+        _SUPABASE_CLIENT = create_client(url, key)
+        return _SUPABASE_CLIENT
+    except Exception as e:
+        _warn_once(f"failed to create Supabase client: {e}")
+        return None
 
 
 def _fallback_path(run_id: str) -> str:
@@ -44,6 +74,14 @@ def canvs_report(
     metrics: dict | None = None,
     payload: dict | None = None,
 ) -> None:
+    """Record a run/node lifecycle or metric event.
+
+    Always appends to the local JSONL fallback file -- that file is the
+    source of truth for local runs. When SUPABASE_URL/SUPABASE_KEY are
+    set, additionally pushes the same event to Supabase as a remote
+    mirror + realtime channel. A Supabase failure is warned once and
+    never affects the local write or raises into the caller.
+    """
     step = None
     values = metrics
     if metrics is not None and "step" in metrics:
@@ -60,13 +98,11 @@ def canvs_report(
         "ts": time.time(),
     }
 
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_KEY")
-    if url and key:
-        try:
-            from supabase import create_client
+    _write_fallback(record)
 
-            client = create_client(url, key)
+    client = _get_supabase_client()
+    if client is not None:
+        try:
             client.table("metrics").insert({
                 "run_id": run_id,
                 "event": event,
@@ -75,11 +111,8 @@ def canvs_report(
                 "values": values,
                 "payload": payload,
             }).execute()
-            return
         except Exception as e:
-            _warn_once(f"Supabase insert failed ({e}); falling back to local JSONL logging.")
-
-    _write_fallback(record)
+            _warn_once(f"Supabase insert failed ({e}); continuing with local JSONL only.")
 
 
 def canvs_metric(run_id: str, node: str, step: int, **values) -> None:

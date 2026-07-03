@@ -17,8 +17,10 @@ import {
   getRun,
   getRunMetrics,
   killRun,
+  listRuns,
   validateGraph,
 } from "./api";
+import { subscribeToRunMetrics, type RealtimeHandle } from "./realtime";
 import type {
   Graph,
   GraphError,
@@ -26,9 +28,37 @@ import type {
   NodeRunStatus,
   NodeSpec,
   RegistryResponse,
+  RunHistoryEntry,
   RunStatus,
   RunTarget,
 } from "./types";
+
+const KAGGLE_CONFIG_KEY = "canvs:kaggleConfig";
+
+export interface KaggleConfig {
+  title: string;
+  datasetSlugs: string[];
+  gpu: boolean;
+}
+
+function readKaggleConfig(defaultTitle: string): KaggleConfig {
+  try {
+    const raw = localStorage.getItem(KAGGLE_CONFIG_KEY);
+    if (!raw) return { title: defaultTitle, datasetSlugs: [], gpu: false };
+    const parsed = JSON.parse(raw);
+    return {
+      title: typeof parsed.title === "string" ? parsed.title : defaultTitle,
+      datasetSlugs: Array.isArray(parsed.datasetSlugs) ? parsed.datasetSlugs : [],
+      gpu: Boolean(parsed.gpu),
+    };
+  } catch {
+    return { title: defaultTitle, datasetSlugs: [], gpu: false };
+  }
+}
+
+function writeKaggleConfig(config: KaggleConfig) {
+  localStorage.setItem(KAGGLE_CONFIG_KEY, JSON.stringify(config));
+}
 
 const CATEGORY_PALETTE = [
   "#6ea8fe",
@@ -78,6 +108,9 @@ interface RunState {
   artifactFilename: string | null;
   showInstructions: boolean;
   runError: string | null;
+  kernelUrl: string | null;
+  liveMode: "live" | "polling";
+  readOnly: boolean;
 }
 
 const initialRunState: RunState = {
@@ -92,6 +125,9 @@ const initialRunState: RunState = {
   artifactFilename: null,
   showInstructions: false,
   runError: null,
+  kernelUrl: null,
+  liveMode: "polling",
+  readOnly: false,
 };
 
 interface StoreState {
@@ -104,10 +140,20 @@ interface StoreState {
   graphName: string;
   validationErrors: GraphError[];
   backendHealthy: boolean | null;
+  supabaseConfigured: boolean;
+  kaggleAvailable: boolean | null;
+  kaggleUnavailableReason: string | null;
+  kaggleConfig: KaggleConfig;
   run: RunState;
+  historyRuns: RunHistoryEntry[];
 
   loadRegistry: () => Promise<void>;
   checkHealth: () => Promise<void>;
+  updateKaggleConfig: (patch: Partial<KaggleConfig>) => void;
+  pushToKaggle: () => Promise<void>;
+  loadHistory: () => Promise<void>;
+  viewHistoryRun: (runId: string) => Promise<void>;
+  restoreHistoryGraph: (runId: string) => void;
 
   onNodesChange: (changes: NodeChange<CanvsNode>[]) => void;
   onEdgesChange: (changes: EdgeChange[]) => void;
@@ -131,13 +177,30 @@ interface StoreState {
 }
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let realtimeHandle: RealtimeHandle | null = null;
 
-function stopPolling(set: (partial: Partial<StoreState> | ((s: StoreState) => Partial<StoreState>)) => void) {
+type Setter = (partial: Partial<StoreState> | ((s: StoreState) => Partial<StoreState>)) => void;
+
+function stopPolling(set: Setter) {
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
   }
   set((s) => ({ run: { ...s.run, polling: false } }));
+}
+
+function stopRealtime() {
+  if (realtimeHandle) {
+    realtimeHandle.stop();
+    realtimeHandle = null;
+  }
+}
+
+function mergeNewEvents(existing: MetricEvent[], incoming: MetricEvent[]): MetricEvent[] {
+  const seen = new Set(existing.map((e) => e.id));
+  const fresh = incoming.filter((e) => !seen.has(e.id));
+  if (fresh.length === 0) return existing;
+  return [...existing, ...fresh];
 }
 
 function applyEventsToNodes(nodes: CanvsNode[], events: MetricEvent[]): CanvsNode[] {
@@ -168,51 +231,95 @@ function applyEventsToNodes(nodes: CanvsNode[], events: MetricEvent[]): CanvsNod
   return nodes.map((n) => byId.get(n.id) ?? n);
 }
 
-function startPolling(
-  get: () => StoreState,
-  set: (partial: Partial<StoreState> | ((s: StoreState) => Partial<StoreState>)) => void
-) {
-  stopPolling(set);
+async function pollOnce(get: () => StoreState, set: Setter): Promise<boolean> {
+  const { run } = get();
+  if (!run.runId) return true;
+
+  try {
+    const [metricsRes, runRes] = await Promise.all([
+      getRunMetrics(run.runId, run.lastEventId).catch((e) => {
+        if (e instanceof ApiError && e.status === 404) return { events: [] };
+        throw e;
+      }),
+      getRun(run.runId),
+    ]);
+
+    set({ backendHealthy: true });
+
+    set((s) => {
+      const events = mergeNewEvents(s.run.events, metricsRes.events);
+      const lastEventId = events.length > 0 ? Math.max(...events.map((e) => e.id)) : s.run.lastEventId;
+      return {
+        nodes: applyEventsToNodes(s.nodes, metricsRes.events),
+        run: { ...s.run, status: runRes.status, lastEventId, events, log: runRes.log },
+      };
+    });
+
+    return TERMINAL_STATUSES.includes(runRes.status);
+  } catch {
+    set({ backendHealthy: false });
+    return false;
+  }
+}
+
+function beginPolling(get: () => StoreState, set: Setter, intervalMs: number) {
+  if (pollTimer) clearInterval(pollTimer);
   set((s) => ({ run: { ...s.run, polling: true } }));
 
   pollTimer = setInterval(async () => {
-    const { run } = get();
-    if (!run.runId) {
+    const terminal = await pollOnce(get, set);
+    if (terminal) {
       stopPolling(set);
+      stopRealtime();
+    }
+  }, intervalMs);
+}
+
+function handleRealtimeEvent(set: Setter, ev: MetricEvent) {
+  set((s) => {
+    const events = mergeNewEvents(s.run.events, [ev]);
+    if (events === s.run.events) return {};
+    const lastEventId = Math.max(s.run.lastEventId, ev.id);
+    return {
+      nodes: applyEventsToNodes(s.nodes, [ev]),
+      run: { ...s.run, events, lastEventId },
+    };
+  });
+}
+
+// Prefers a live Supabase realtime channel (with a slow 10s poll as a
+// gap-filler, since realtime can drop events across a reconnect) and
+// falls back to the original 1s poll whenever Supabase isn't
+// configured or the channel fails to open or later errors out.
+async function startMetricsStream(get: () => StoreState, set: Setter) {
+  stopPolling(set);
+  stopRealtime();
+
+  const { run, supabaseConfigured } = get();
+  const runId = run.runId;
+  if (!runId) return;
+
+  if (supabaseConfigured) {
+    const handle = await subscribeToRunMetrics(
+      runId,
+      (ev) => handleRealtimeEvent(set, ev),
+      () => {
+        stopRealtime();
+        set((s) => ({ run: { ...s.run, liveMode: "polling" } }));
+        beginPolling(get, set, 1000);
+      }
+    );
+    if (handle && get().run.runId === runId) {
+      realtimeHandle = handle;
+      set((s) => ({ run: { ...s.run, liveMode: "live" } }));
+      beginPolling(get, set, 10000);
       return;
     }
-    try {
-      const [metricsRes, runRes] = await Promise.all([
-        getRunMetrics(run.runId, run.lastEventId).catch((e) => {
-          if (e instanceof ApiError && e.status === 404) return { events: [] };
-          throw e;
-        }),
-        getRun(run.runId),
-      ]);
+    if (handle) handle.stop(); // run changed while we were connecting
+  }
 
-      set({ backendHealthy: true });
-
-      const newEvents = metricsRes.events;
-      const lastEventId = newEvents.length > 0 ? newEvents[newEvents.length - 1].id : run.lastEventId;
-
-      set((s) => ({
-        nodes: applyEventsToNodes(s.nodes, newEvents),
-        run: {
-          ...s.run,
-          status: runRes.status,
-          lastEventId,
-          events: [...s.run.events, ...newEvents],
-          log: runRes.log,
-        },
-      }));
-
-      if (TERMINAL_STATUSES.includes(runRes.status)) {
-        stopPolling(set);
-      }
-    } catch {
-      set({ backendHealthy: false });
-    }
-  }, 1000);
+  set((s) => ({ run: { ...s.run, liveMode: "polling" } }));
+  beginPolling(get, set, 1000);
 }
 
 export const useStore = create<StoreState>((set, get) => ({
@@ -225,7 +332,12 @@ export const useStore = create<StoreState>((set, get) => ({
   graphName: "untitled",
   validationErrors: [],
   backendHealthy: null,
+  supabaseConfigured: false,
+  kaggleAvailable: null,
+  kaggleUnavailableReason: null,
+  kaggleConfig: readKaggleConfig("untitled"),
   run: initialRunState,
+  historyRuns: [],
 
   loadRegistry: async () => {
     const registry = await getRegistry();
@@ -235,11 +347,23 @@ export const useStore = create<StoreState>((set, get) => ({
   checkHealth: async () => {
     try {
       const health = await getHealth();
-      set({ backendHealthy: health.ok });
+      set({
+        backendHealthy: health.ok,
+        supabaseConfigured: health.supabase,
+        kaggleAvailable: health.kaggle.available,
+        kaggleUnavailableReason: health.kaggle.reason,
+      });
     } catch {
       set({ backendHealthy: false });
     }
   },
+
+  updateKaggleConfig: (patch) =>
+    set((s) => {
+      const next = { ...s.kaggleConfig, ...patch };
+      writeKaggleConfig(next);
+      return { kaggleConfig: next };
+    }),
 
   onNodesChange: (changes) => set((s) => ({ nodes: applyNodeChanges<CanvsNode>(changes, s.nodes) })),
 
@@ -287,7 +411,9 @@ export const useStore = create<StoreState>((set, get) => ({
 
   selectNode: (nodeId) => set({ selectedNodeId: nodeId }),
 
-  newGraph: () =>
+  newGraph: () => {
+    stopPolling(set);
+    stopRealtime();
     set({
       nodes: [],
       edges: [],
@@ -297,7 +423,8 @@ export const useStore = create<StoreState>((set, get) => ({
       graphName: "untitled",
       validationErrors: [],
       run: initialRunState,
-    }),
+    });
+  },
 
   toGraphJSON: () => {
     const { nodes, edges, graphId, graphName } = get();
@@ -363,6 +490,8 @@ export const useStore = create<StoreState>((set, get) => ({
       targetHandle: ge.target_port,
     }));
 
+    stopPolling(set);
+    stopRealtime();
     set({
       nodes,
       edges,
@@ -432,7 +561,56 @@ export const useStore = create<StoreState>((set, get) => ({
       URL.revokeObjectURL(url);
     }
 
-    startPolling(get, set);
+    await startMetricsStream(get, set);
+  },
+
+  pushToKaggle: async () => {
+    const valid = await get().validateNow();
+    if (!valid) return;
+
+    set((s) => ({
+      run: { ...initialRunState, target: "kaggle" },
+      nodes: s.nodes.map((n) => ({ ...n, data: { ...n.data, status: "idle", metrics: [] } })),
+    }));
+
+    const graph = get().toGraphJSON();
+    const { kaggleConfig } = get();
+    const result = await createRun(graph, "kaggle", {
+      push: true,
+      title: kaggleConfig.title,
+      dataset_slugs: kaggleConfig.datasetSlugs,
+      gpu: kaggleConfig.gpu,
+    });
+    if (!result.ok) {
+      set((s) => ({
+        validationErrors: result.errors.errors,
+        nodes: s.nodes.map((n) => ({
+          ...n,
+          data: { ...n.data, errors: result.errors.errors.filter((e) => e.node_id === n.id) },
+        })),
+      }));
+      return;
+    }
+
+    const { data } = result;
+    set((s) => ({
+      run: {
+        ...s.run,
+        runId: data.run_id,
+        status: data.status,
+        kernelUrl: data.kernel_url ?? null,
+        artifactContent: data.artifact_content ?? null,
+        artifactFilename: data.artifact_filename,
+        runError:
+          data.push_available === false
+            ? (data.push_unavailable_reason ?? "Kaggle push unavailable")
+            : null,
+      },
+    }));
+
+    if (data.status === "pushed") {
+      await startMetricsStream(get, set);
+    }
   },
 
   killActiveRun: async () => {
@@ -444,5 +622,53 @@ export const useStore = create<StoreState>((set, get) => ({
 
   dismissInstructions: () => set((s) => ({ run: { ...s.run, showInstructions: false } })),
 
-  resetRunView: () => set({ run: initialRunState }),
+  resetRunView: () => {
+    stopPolling(set);
+    stopRealtime();
+    set({ run: initialRunState });
+  },
+
+  loadHistory: async () => {
+    const res = await listRuns();
+    set({ historyRuns: res.runs });
+  },
+
+  viewHistoryRun: async (runId) => {
+    stopPolling(set);
+    stopRealtime();
+
+    const entry = get().historyRuns.find((r) => r.run_id === runId);
+    const metricsRes = await getRunMetrics(runId, 0);
+    const events = metricsRes.events;
+    const lastEventId = events.length > 0 ? Math.max(...events.map((e) => e.id)) : 0;
+
+    set((s) => ({
+      selectedNodeId: null,
+      run: {
+        ...initialRunState,
+        runId,
+        target: entry?.target ?? "local",
+        status: entry?.status ?? null,
+        events,
+        lastEventId,
+        readOnly: true,
+      },
+      nodes: applyEventsToNodes(
+        s.nodes.map((n) => ({ ...n, data: { ...n.data, status: "idle" as const, metrics: [] } })),
+        events
+      ),
+    }));
+  },
+
+  restoreHistoryGraph: (runId) => {
+    const entry = get().historyRuns.find((r) => r.run_id === runId);
+    if (!entry) return;
+
+    const hasExistingWork = get().nodes.length > 0;
+    if (hasExistingWork && !window.confirm("Restore this run's graph? Unsaved canvas changes will be lost.")) {
+      return;
+    }
+
+    get().loadFromGraphJSON(entry.graph);
+  },
 }));

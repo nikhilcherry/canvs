@@ -74,19 +74,30 @@ export interface ValidateResponse {
 
 export type RunTarget = "local" | "kaggle" | "colab";
 
-export type RunStatus = "pending" | "running" | "compiled" | "done" | "failed";
+export type RunStatus = "pending" | "running" | "compiled" | "pushed" | "done" | "failed";
+
+export interface KaggleRunOptions {
+  push: boolean;
+  title: string;
+  dataset_slugs: string[];
+  gpu: boolean;
+}
 
 export interface CreateRunResponse {
   run_id: string;
   status: RunStatus;
   artifact_filename: string;
   artifact_content?: string;
+  kernel_url?: string;
+  push_available?: boolean;
+  push_unavailable_reason?: string;
 }
 
 export interface RunDetailResponse {
   run_id: string;
   status: RunStatus;
   log: string[];
+  kernel_slug?: string;
 }
 
 export interface KillRunResponse {
@@ -120,6 +131,20 @@ export interface MetricsResponse {
 export interface HealthResponse {
   ok: boolean;
   supabase: boolean;
+  kaggle: { available: boolean; reason: string | null };
 }
 
 export type NodeRunStatus = "idle" | "running" | "done" | "failed";
+
+export interface RunHistoryEntry {
+  run_id: string;
+  name: string;
+  target: RunTarget;
+  status: RunStatus;
+  created_at: string;
+  graph: Graph;
+}
+
+export interface RunHistoryResponse {
+  runs: RunHistoryEntry[];
+}

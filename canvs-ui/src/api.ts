@@ -5,10 +5,12 @@ import type {
   CreateRunResponse,
   Graph,
   HealthResponse,
+  KaggleRunOptions,
   KillRunResponse,
   MetricsResponse,
   RegistryResponse,
   RunDetailResponse,
+  RunHistoryResponse,
   RunTarget,
   ValidateResponse,
 } from "./types";
@@ -61,12 +63,13 @@ export function validateGraph(graph: Graph): Promise<ValidateResponse> {
 
 export async function createRun(
   graph: Graph,
-  target: RunTarget
+  target: RunTarget,
+  kaggle?: KaggleRunOptions
 ): Promise<{ ok: true; data: CreateRunResponse } | { ok: false; errors: ValidateResponse }> {
   try {
     const data = await request<CreateRunResponse>("/runs", {
       method: "POST",
-      body: JSON.stringify({ graph, target }),
+      body: JSON.stringify(kaggle ? { graph, target, kaggle } : { graph, target }),
     });
     return { ok: true, data };
   } catch (e) {
@@ -87,4 +90,8 @@ export function getRunMetrics(runId: string, afterId: number): Promise<MetricsRe
 
 export function killRun(runId: string): Promise<KillRunResponse> {
   return request(`/runs/${encodeURIComponent(runId)}/kill`, { method: "POST" });
+}
+
+export function listRuns(): Promise<RunHistoryResponse> {
+  return request("/runs");
 }

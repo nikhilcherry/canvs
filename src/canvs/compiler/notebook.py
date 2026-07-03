@@ -12,7 +12,7 @@ KAGGLE_DATASET_NOTE = (
 )
 
 
-def compile_notebook(graph, registry, run_id: str, target: str) -> str:
+def compile_notebook(graph, registry, run_id: str, target: str, env_vars: dict[str, str] | None = None) -> str:
     used_specs = sorted({n.spec for n in graph.nodes})
 
     pip_packages = {"supabase"}
@@ -31,6 +31,8 @@ def compile_notebook(graph, registry, run_id: str, target: str) -> str:
     cells = []
     if target == "kaggle":
         cells.append(new_markdown_cell(KAGGLE_DATASET_NOTE))
+    if env_vars:
+        cells.append(new_code_cell(templates.render_env_cell(env_vars)))
 
     cells.append(new_code_cell(header_cell_source))
     for spec_id in used_specs:

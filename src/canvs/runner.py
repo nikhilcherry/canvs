@@ -40,6 +40,12 @@ class RunHandle:
         return last
 
     def status(self) -> str:
+        """Combine the subprocess exit code with the last local JSONL event.
+
+        The reporter now always dual-writes to this JSONL file regardless
+        of whether Supabase is configured, so this read is reliable for
+        every local run.
+        """
         exit_code = self.process.poll()
         last_event = self._last_event()
 
@@ -61,6 +67,11 @@ class RunHandle:
     def kill(self) -> None:
         if self.process.poll() is None:
             self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
 
 
 class LocalRunner:

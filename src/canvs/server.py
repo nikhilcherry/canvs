@@ -11,12 +11,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from . import kaggle_push, reporter, run_history
 from .compiler import compile_graph
 from .graph import Graph
 from .registry import registry
 from .runner import LocalRunner
 
 runner = LocalRunner()
+
+# run_id -> kernel_slug, for runs pushed to Kaggle.
+_kaggle_kernels: dict[str, str] = {}
 
 
 @asynccontextmanager
@@ -40,9 +44,17 @@ app.add_middleware(
 )
 
 
+class KaggleRunOptions(BaseModel):
+    push: bool = False
+    title: str = "canvs-pipeline"
+    dataset_slugs: list[str] = []
+    gpu: bool = False
+
+
 class RunRequest(BaseModel):
     graph: Graph
     target: Literal["local", "kaggle", "colab"] = "local"
+    kaggle: KaggleRunOptions | None = None
 
 
 def _supabase_configured() -> bool:
@@ -51,7 +63,27 @@ def _supabase_configured() -> bool:
 
 @app.get("/health")
 def get_health() -> dict:
-    return {"ok": True, "supabase": _supabase_configured()}
+    kaggle_available, kaggle_reason = kaggle_push.is_available()
+    return {
+        "ok": True,
+        "supabase": _supabase_configured(),
+        "kaggle": {"available": kaggle_available, "reason": kaggle_reason},
+    }
+
+
+@app.get("/config")
+def get_config() -> dict:
+    """Anon Supabase credentials for the frontend's realtime channel.
+
+    Only served when Supabase is configured -- the frontend checks
+    /health first and only calls this when health.supabase is true.
+    """
+    if not _supabase_configured():
+        raise HTTPException(status_code=404, detail="Supabase not configured")
+    return {
+        "supabase_url": os.environ["SUPABASE_URL"],
+        "supabase_anon_key": os.environ["SUPABASE_KEY"],
+    }
 
 
 @app.get("/registry")
@@ -75,42 +107,102 @@ def create_run(req: RunRequest) -> dict:
         )
 
     run_id = uuid.uuid4().hex
+
+    if req.target == "kaggle" and req.kaggle is not None and req.kaggle.push:
+        available, reason = kaggle_push.is_available()
+        if not available:
+            artifact = compile_graph(req.graph, req.target, run_id, registry=registry)
+            return {
+                "run_id": run_id,
+                "status": "compiled",
+                "artifact_filename": artifact.filename,
+                "artifact_content": artifact.content,
+                "push_available": False,
+                "push_unavailable_reason": reason,
+            }
+
+        env_vars = None
+        if _supabase_configured():
+            env_vars = {
+                "SUPABASE_URL": os.environ["SUPABASE_URL"],
+                "SUPABASE_KEY": os.environ["SUPABASE_KEY"],
+            }
+        artifact = compile_graph(req.graph, req.target, run_id, registry=registry, env_vars=env_vars)
+        kernel_ref = kaggle_push.push_kernel(
+            artifact,
+            title=req.kaggle.title,
+            dataset_slugs=req.kaggle.dataset_slugs,
+            gpu=req.kaggle.gpu,
+        )
+        _kaggle_kernels[run_id] = kernel_ref["kernel_slug"]
+        run_history.create_run_record(run_id, req.graph.name, "kaggle", "pushed", req.graph.model_dump())
+
+        return {
+            "run_id": run_id,
+            "status": "pushed",
+            "artifact_filename": artifact.filename,
+            "kernel_url": kernel_ref["url"],
+        }
+
     artifact = compile_graph(req.graph, req.target, run_id, registry=registry)
 
     if req.target == "local":
         runner.start(artifact)
+        run_history.create_run_record(run_id, req.graph.name, "local", "pending", req.graph.model_dump())
         return {
             "run_id": run_id,
             "status": "pending",
             "artifact_filename": artifact.filename,
         }
 
-    return {
+    result = {
         "run_id": run_id,
         "status": "compiled",
         "artifact_filename": artifact.filename,
         "artifact_content": artifact.content,
     }
+    if req.target == "kaggle":
+        available, reason = kaggle_push.is_available()
+        result["push_available"] = available
+        if not available:
+            result["push_unavailable_reason"] = reason
+    return result
+
+
+@app.get("/runs")
+def list_runs() -> dict:
+    return {"runs": run_history.list_runs()}
 
 
 @app.get("/runs/{run_id}")
 def get_run(run_id: str) -> dict:
+    kernel_slug = _kaggle_kernels.get(run_id)
+    if kernel_slug is not None:
+        status_info = kaggle_push.kernel_status(kernel_slug)
+        run_history.update_run_status(run_id, status_info["status"])
+        return {
+            "run_id": run_id,
+            "status": status_info["status"],
+            "log": [],
+            "kernel_slug": kernel_slug,
+        }
+
     handle = runner.get(run_id)
     if handle is None:
         raise HTTPException(status_code=404, detail="Unknown run_id")
+    status = handle.status()
+    run_history.update_run_status(run_id, status)
     return {
         "run_id": run_id,
-        "status": handle.status(),
+        "status": status,
         "log": handle.tail_log(50),
     }
 
 
 @app.get("/runs/{run_id}/metrics")
 def get_run_metrics(run_id: str, after_id: int = 0) -> dict:
-    if _supabase_configured():
-        from supabase import create_client
-
-        client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    client = reporter._get_supabase_client() if _supabase_configured() else None
+    if client is not None:
         resp = (
             client.table("metrics")
             .select("*")

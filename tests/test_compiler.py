@@ -53,8 +53,8 @@ def test_local_script_self_contained_and_valid_python():
     assert "def make_numbers" in artifact.content
     assert "def scale" in artifact.content
     assert "def report" in artifact.content
-    assert "out_n1 = make_numbers(n=5)" in artifact.content
-    assert "out_n2 = scale(out_n1, factor=3.0)" in artifact.content
+    assert "out_n1 = make_numbers__data(n=5)" in artifact.content
+    assert "out_n2 = scale__proc(out_n1, factor=3.0)" in artifact.content
     assert "_run_id=RUN_ID" in artifact.content
     assert "_node_id='n3'" in artifact.content
 
@@ -108,3 +108,61 @@ def test_colab_notebook_has_no_dataset_markdown():
     artifact = compile_graph(_build_graph(), "colab", "run789", registry=registry)
     nb = nbformat.reads(artifact.content, as_version=4)
     assert not any(c.cell_type == "markdown" for c in nb.cells)
+
+
+def test_kaggle_notebook_injects_env_cell_when_provided():
+    _register_pipeline_nodes()
+    artifact = compile_graph(
+        _build_graph(),
+        "kaggle",
+        "run999",
+        registry=registry,
+        env_vars={"SUPABASE_URL": "https://x.supabase.co", "SUPABASE_KEY": "anon-key"},
+    )
+    nb = nbformat.reads(artifact.content, as_version=4)
+    env_cells = [
+        c for c in nb.cells if c.cell_type == "code" and "os.environ['SUPABASE_URL']" in c.source
+    ]
+    assert len(env_cells) == 1
+    assert "os.environ['SUPABASE_URL'] = 'https://x.supabase.co'" in env_cells[0].source
+    assert "os.environ['SUPABASE_KEY'] = 'anon-key'" in env_cells[0].source
+
+
+def test_kaggle_notebook_no_env_cell_when_not_provided():
+    _register_pipeline_nodes()
+    artifact = compile_graph(_build_graph(), "kaggle", "run998", registry=registry)
+    assert "os.environ['SUPABASE_URL']" not in artifact.content
+
+
+def test_same_function_name_different_categories_no_collision(tmp_path, monkeypatch):
+    monkeypatch.setenv("CANVS_RUNS_DIR", str(tmp_path))
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+
+    @node(category="data", name="Data Load")
+    def load(n: int = 2) -> list:
+        return [1] * n
+
+    @node(category="model", name="Model Load")
+    def load(path: str = "x") -> str:  # noqa: F811 -- deliberately shadows above at Python level, not at node-id level
+        return f"model:{path}"
+
+    graph = Graph(
+        graph_id="g1",
+        name="p",
+        nodes=[
+            GraphNode(id="n1", spec="data.load", config={"n": 2}),
+            GraphNode(id="n2", spec="model.load", config={"path": "abc"}),
+        ],
+    )
+    artifact = compile_graph(graph, "local", "collision1", registry=registry)
+
+    assert artifact.content.count("def load__data(") == 1
+    assert artifact.content.count("def load__model(") == 1
+    assert "out_n1 = load__data(n=2)" in artifact.content
+    assert "out_n2 = load__model(path='abc')" in artifact.content
+
+    ns: dict = {}
+    exec(compile(artifact.content, "<pipeline>", "exec"), ns)
+    assert ns["out_n1"] == [1, 1]
+    assert ns["out_n2"] == "model:abc"

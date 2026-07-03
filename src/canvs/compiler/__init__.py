@@ -18,7 +18,13 @@ class CompiledArtifact(BaseModel):
     content: str
 
 
-def compile_graph(graph, target: Target, run_id: str, registry=None) -> CompiledArtifact:
+def compile_graph(
+    graph,
+    target: Target,
+    run_id: str,
+    registry=None,
+    env_vars: dict[str, str] | None = None,
+) -> CompiledArtifact:
     if registry is None:
         from ..registry import registry
 
@@ -26,7 +32,7 @@ def compile_graph(graph, target: Target, run_id: str, registry=None) -> Compiled
         content = compile_script(graph, registry, run_id)
         filename = "pipeline.py"
     elif target in ("kaggle", "colab"):
-        content = compile_notebook(graph, registry, run_id, target)
+        content = compile_notebook(graph, registry, run_id, target, env_vars=env_vars)
         filename = "pipeline.ipynb"
     else:
         raise ValueError(f"Unknown target: {target!r}")

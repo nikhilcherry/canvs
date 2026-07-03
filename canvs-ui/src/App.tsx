@@ -2,8 +2,8 @@ import { useEffect } from "react";
 import { Canvas } from "./components/Canvas";
 import { GraphIO } from "./components/GraphIO";
 import { Inspector } from "./components/Inspector";
-import { Palette } from "./components/Palette";
 import { RunBar } from "./components/RunBar";
+import { Sidebar } from "./components/Sidebar";
 import { useStore } from "./store";
 
 export function App() {
@@ -29,7 +29,7 @@ export function App() {
         <RunBar />
       </div>
       <div className="main-layout">
-        <Palette />
+        <Sidebar />
         <Canvas />
         <div className="inspector-panel">
           <Inspector />
