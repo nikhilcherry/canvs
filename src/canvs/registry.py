@@ -160,7 +160,13 @@ def node(
         return_annotation = sig.return_annotation
         outputs = [] if return_annotation is inspect.Signature.empty else ["output"]
 
-        raw_source = inspect.getsource(func)
+        try:
+            raw_source = inspect.getsource(func)
+        except OSError as exc:
+            raise OSError(
+                f"Could not read source for node {node_id!r}: nodes must be "
+                "defined in importable .py files (not the stdin/REPL)."
+            ) from exc
         dedented = textwrap.dedent(raw_source)
         source = _strip_decorator(dedented)
 

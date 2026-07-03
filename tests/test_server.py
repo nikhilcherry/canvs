@@ -1,4 +1,5 @@
 import json
+import sys
 import time
 
 from fastapi.testclient import TestClient
@@ -12,6 +13,9 @@ from canvs.server import app
 def test_health_reports_kaggle_and_supabase_flags(monkeypatch):
     monkeypatch.delenv("SUPABASE_URL", raising=False)
     monkeypatch.delenv("SUPABASE_KEY", raising=False)
+    # Force the import to fail regardless of whether `kaggle` happens to be
+    # installed in the environment running this test.
+    monkeypatch.setitem(sys.modules, "kaggle.api.kaggle_api_extended", None)
 
     with TestClient(app) as client:
         resp = client.get("/health")

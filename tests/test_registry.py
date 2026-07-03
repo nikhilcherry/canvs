@@ -129,3 +129,18 @@ def test_decorated_function_still_plain_callable():
         return x + 1
 
     assert add_one(4) == 5
+
+
+def test_getsource_failure_raises_helpful_message(monkeypatch):
+    import inspect as inspect_module
+
+    def fake_getsource(func):
+        raise OSError("could not find source code")
+
+    monkeypatch.setattr(inspect_module, "getsource", fake_getsource)
+
+    with pytest.raises(OSError, match="importable .py files"):
+
+        @node(category="test")
+        def sample() -> int:
+            return 1

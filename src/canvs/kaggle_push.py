@@ -68,12 +68,15 @@ def push_kernel(
     """Push a compiled notebook artifact as a Kaggle kernel.
 
     Returns {"kernel_slug": "user/slug", "url": "..."}. The run_id
-    suffix on the slug guarantees uniqueness across repeated pushes of
-    the same title.
+    suffix is folded into the *title* (not just the metadata id) because
+    Kaggle derives the real slug from the title server-side and silently
+    ignores a custom id that doesn't match it -- the returned kernel_slug
+    always reflects the API's actual `ref`, never a locally-guessed one.
     """
     api = _get_api()
     username = _username(api)
-    kernel_slug = f"{username}/{_slugify(title)}-{artifact.run_id[:8]}"
+    unique_title = f"{title}-{artifact.run_id[:8]}"
+    kernel_slug = f"{username}/{_slugify(unique_title)}"
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         with open(os.path.join(tmp_dir, artifact.filename), "w") as f:
@@ -81,7 +84,7 @@ def push_kernel(
 
         metadata = {
             "id": kernel_slug,
-            "title": title,
+            "title": unique_title,
             "code_file": artifact.filename,
             "language": "python",
             "kernel_type": "notebook",
@@ -96,9 +99,20 @@ def push_kernel(
         with open(os.path.join(tmp_dir, "kernel-metadata.json"), "w") as f:
             json.dump(metadata, f)
 
-        api.kernels_push_cli(tmp_dir)
+        # kernels_push (not the _cli wrapper, which only prints and returns
+        # None) has no keyword defaults in kaggle>=2.2 -- acc=None defers to
+        # the enable_gpu flag already set in kernel-metadata.json above.
+        result = api.kernels_push(tmp_dir, None, None)
 
-    return {"kernel_slug": kernel_slug, "url": f"https://www.kaggle.com/code/{kernel_slug}"}
+    if getattr(result, "error", None):
+        raise RuntimeError(f"Kaggle kernel push failed: {result.error}")
+
+    ref = getattr(result, "ref", None)
+    actual_slug = ref[len("/code/") :] if ref and ref.startswith("/code/") else kernel_slug
+    return {
+        "kernel_slug": actual_slug,
+        "url": getattr(result, "url", None) or f"https://www.kaggle.com/code/{actual_slug}",
+    }
 
 
 def kernel_status(kernel_slug: str) -> dict:

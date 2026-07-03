@@ -1,20 +1,41 @@
 import json
 import os
+import sys
 from types import SimpleNamespace
+
+import pytest
 
 from canvs import kaggle_push
 
 
+class FakeResult:
+    def __init__(self, ref, url, error=None):
+        self.ref = ref
+        self.url = url
+        self.error = error
+
+
 class FakeApi:
-    def __init__(self, username="alice"):
+    def __init__(self, username="alice", error=None):
         self.config_values = {"username": username}
         self.last_metadata = None
         self.pushed_folders = []
+        self.last_timeout = "unset"
+        self.last_acc = "unset"
+        self._error = error
 
-    def kernels_push_cli(self, folder):
+    def kernels_push(self, folder, timeout, acc):
         self.pushed_folders.append(folder)
+        self.last_timeout = timeout
+        self.last_acc = acc
         with open(os.path.join(folder, "kernel-metadata.json")) as f:
             self.last_metadata = json.load(f)
+        if self._error:
+            return FakeResult(ref=None, url=None, error=self._error)
+        # Mirrors the real API: ref/url are derived from the metadata id,
+        # which push_kernel constructs so title and id always agree.
+        slug = self.last_metadata["id"]
+        return FakeResult(ref=f"/code/{slug}", url=f"https://www.kaggle.com/code/{slug}")
 
 
 def test_push_kernel_writes_expected_metadata(monkeypatch):
@@ -28,9 +49,11 @@ def test_push_kernel_writes_expected_metadata(monkeypatch):
 
     assert ref["kernel_slug"] == "alice/my-pipeline-01234567"
     assert ref["url"] == "https://www.kaggle.com/code/alice/my-pipeline-01234567"
+    assert fake.last_timeout is None
+    assert fake.last_acc is None
     assert fake.last_metadata == {
         "id": "alice/my-pipeline-01234567",
-        "title": "My Pipeline!",
+        "title": "My Pipeline!-01234567",
         "code_file": "pipeline.ipynb",
         "language": "python",
         "kernel_type": "notebook",
@@ -59,6 +82,37 @@ def test_push_kernel_slug_unique_per_run_id(monkeypatch):
     assert ref1["kernel_slug"] != ref2["kernel_slug"]
 
 
+def test_push_kernel_trusts_api_ref_over_local_guess(monkeypatch):
+    # Kaggle derives the real slug from title server-side and can diverge
+    # from whatever we compute locally (this is what broke the live smoke
+    # test: kernel_status polling used a locally-guessed slug that Kaggle
+    # never actually created).
+    fake = FakeApi()
+    monkeypatch.setattr(kaggle_push, "_get_api", lambda: fake)
+    monkeypatch.setattr(
+        fake,
+        "kernels_push",
+        lambda folder, timeout, acc: FakeResult(
+            ref="/code/alice/some-other-slug", url="https://www.kaggle.com/code/alice/some-other-slug"
+        ),
+    )
+
+    artifact = SimpleNamespace(run_id="0123456789ab", filename="pipeline.ipynb", content="{}")
+    ref = kaggle_push.push_kernel(artifact, title="My Pipeline!", dataset_slugs=[], gpu=False)
+
+    assert ref["kernel_slug"] == "alice/some-other-slug"
+    assert ref["url"] == "https://www.kaggle.com/code/alice/some-other-slug"
+
+
+def test_push_kernel_raises_on_api_error(monkeypatch):
+    fake = FakeApi(error="Title must be at least five characters")
+    monkeypatch.setattr(kaggle_push, "_get_api", lambda: fake)
+
+    artifact = SimpleNamespace(run_id="0123456789ab", filename="pipeline.ipynb", content="{}")
+    with pytest.raises(RuntimeError, match="Title must be at least five characters"):
+        kaggle_push.push_kernel(artifact, title="hi", dataset_slugs=[], gpu=False)
+
+
 def test_kernel_status_normalizes_kaggle_values(monkeypatch):
     class FakeResponse:
         def __init__(self, status):
@@ -82,9 +136,10 @@ def test_kernel_status_normalizes_kaggle_values(monkeypatch):
         assert kaggle_push.kernel_status("alice/slug") == {"status": expected}
 
 
-def test_is_available_false_when_kaggle_package_missing():
-    # This sandbox has no `kaggle` package installed -- exercises the real
-    # ImportError path rather than a mock.
+def test_is_available_false_when_kaggle_package_missing(monkeypatch):
+    # Force the import to fail regardless of whether `kaggle` happens to be
+    # installed in the environment running this test.
+    monkeypatch.setitem(sys.modules, "kaggle.api.kaggle_api_extended", None)
     available, reason = kaggle_push.is_available()
     assert available is False
     assert "kaggle package not installed" in reason
