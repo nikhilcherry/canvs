@@ -34,6 +34,20 @@ def test_valid_graph_has_no_errors():
     assert graph.validate_against(registry) == []
 
 
+def test_duplicate_node_id_error():
+    _register_common_nodes()
+    graph = Graph(
+        graph_id="g1",
+        name="p",
+        nodes=[
+            GraphNode(id="n1", spec="data.source", config={}),
+            GraphNode(id="n1", spec="proc.step", config={"factor": 2}),
+        ],
+    )
+    errors = graph.validate_against(registry)
+    assert any(e.field == "id" and "Duplicate node id" in e.message for e in errors)
+
+
 def test_unknown_spec_error():
     _register_common_nodes()
     graph = Graph(

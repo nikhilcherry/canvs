@@ -42,6 +42,19 @@ class Graph(BaseModel):
         errors: list[GraphError] = []
         node_map = self._node_map()
 
+        # 0. no duplicate node ids. _node_map() (and topo_order()) key off
+        # id, so a duplicate silently drops all but the last node with that
+        # id from the graph -- everything downstream would "validate"
+        # cleanly against a graph the user never actually built.
+        seen_ids: set[str] = set()
+        for gn in self.nodes:
+            if gn.id in seen_ids:
+                errors.append(GraphError(
+                    node_id=gn.id, field="id",
+                    message=f"Duplicate node id: {gn.id!r}",
+                ))
+            seen_ids.add(gn.id)
+
         # 1. every spec exists; config keys/types/required params.
         for gn in self.nodes:
             if gn.spec not in registry:
