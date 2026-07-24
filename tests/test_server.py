@@ -96,3 +96,34 @@ def test_local_run_persists_and_lists_in_history(tmp_path, monkeypatch):
 
     record = json.loads((tmp_path / run_id / "run.json").read_text())
     assert record["status"] == "done"
+
+
+# --------------------------------------------------------------------------
+# node-module loading at startup
+# --------------------------------------------------------------------------
+
+def test_startup_survives_missing_demo_node_module(monkeypatch, caplog):
+    """`examples/` ships only in a source checkout, never in the wheel.
+
+    The default used to be loaded unconditionally, so a pip-installed canvs
+    raised ModuleNotFoundError inside lifespan and the server refused to boot.
+    """
+    monkeypatch.delenv("CANVS_NODE_MODULES", raising=False)
+    monkeypatch.setattr(server_module, "DEFAULT_NODE_MODULES", "canvs_no_such_demo_module")
+
+    with caplog.at_level("WARNING"):
+        with TestClient(app) as client:
+            assert client.get("/health").status_code == 200
+    assert "canvs_no_such_demo_module" in caplog.text
+
+
+def test_startup_fails_loudly_on_explicitly_configured_missing_module(monkeypatch):
+    """An operator-supplied module that can't import is a real misconfiguration."""
+    monkeypatch.setenv("CANVS_NODE_MODULES", "canvs_definitely_not_installed")
+
+    try:
+        with TestClient(app):
+            pass
+    except ImportError:
+        return
+    raise AssertionError("expected ImportError for an explicitly configured module")

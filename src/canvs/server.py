@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -17,19 +18,38 @@ from .graph import Graph
 from .registry import registry
 from .runner import LocalRunner
 
+log = logging.getLogger(__name__)
+
 runner = LocalRunner()
 
 # run_id -> kernel_slug, for runs pushed to Kaggle.
 _kaggle_kernels: dict[str, str] = {}
 
+# Demo nodes, importable only from a source checkout — `examples/` is not part
+# of the installed package. Missing is normal, so it must not abort startup.
+DEFAULT_NODE_MODULES = "examples.toy_nodes"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    modules = os.environ.get("CANVS_NODE_MODULES", "examples.toy_nodes")
+    configured = os.environ.get("CANVS_NODE_MODULES")
+    modules = configured if configured is not None else DEFAULT_NODE_MODULES
     for mod in modules.split(","):
         mod = mod.strip()
-        if mod:
+        if not mod:
+            continue
+        try:
             registry.load_module(mod)
+        except ImportError:
+            # Modules the operator asked for are a real misconfiguration; the
+            # demo default just isn't there outside a source checkout.
+            if configured is not None:
+                raise
+            log.warning(
+                "Optional demo node module %r not found; starting with no demo "
+                "nodes registered. Set CANVS_NODE_MODULES to load your own.",
+                mod,
+            )
     yield
 
 
